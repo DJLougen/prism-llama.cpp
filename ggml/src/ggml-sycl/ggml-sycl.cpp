@@ -6059,10 +6059,11 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                     return false;
                 }
 
-                if (ggml_is_quantized(src0_type) &&
-                    !ggml_sycl_supports_mmvq(src0_type) &&
-                    !ggml_sycl_supports_dmmv(src0_type) &&
-                    !ggml_sycl_supports_mmq(src0_type)) {
+                if (src0_type == GGML_TYPE_TQ2_0 ||
+                    (ggml_is_quantized(src0_type) &&
+                     !ggml_sycl_supports_mmvq(src0_type) &&
+                     !ggml_sycl_supports_dmmv(src0_type) &&
+                     !ggml_sycl_supports_mmq(src0_type))) {
                     return false;
                 }
 
@@ -6118,6 +6119,9 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
 
         case GGML_OP_SET_ROWS:
             {
+                if (op->type == GGML_TYPE_TQ2_0) {
+                    return false;
+                }
                 auto res = (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 ||
                             op->src[0]->type == GGML_TYPE_BF16) &&
                            (op->src[1]->type == GGML_TYPE_I64 || op->src[1]->type == GGML_TYPE_I32);
@@ -6248,9 +6252,14 @@ static bool do_ggml_backend_sycl_device_supports_op(ggml_backend_dev_t dev, cons
                         src1_type == GGML_TYPE_IQ3_XXS ||
                         src1_type == GGML_TYPE_IQ3_S ||
                         src1_type == GGML_TYPE_IQ1_S ||
-                        src1_type == GGML_TYPE_IQ1_M) {
+                        src1_type == GGML_TYPE_IQ1_M ||
+                        src1_type == GGML_TYPE_TQ2_0) {
                         return false;
                     }
+                }
+
+                if (src0_type == GGML_TYPE_TQ2_0 || src1_type == GGML_TYPE_TQ2_0) {
+                    return false;
                 }
 
                 return true;
