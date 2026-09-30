@@ -1373,6 +1373,122 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         throw std::runtime_error("a tied Hadamard output requires version 2 and tied_output=true");
     }
 
+    // lowbitflash.rot.*: per-weight segmented rotation metadata (version 1).
+    // Keys:
+    //   lowbitflash.rot.version        u32  = 1
+    //   lowbitflash.rot.weight_names   str[] rotated weights (matmul inputs)
+    //   lowbitflash.rot.inverse_names  str[] latent lookup tables (optional)
+    //   lowbitflash.rot.blocks.<name>  i32[] pow2 block sizes partitioning ne[0]
+    //   lowbitflash.rot.signs.<name>   i32[] +/-1 per element of ne[0]
+    {
+        uint32_t lbf_version = 0;
+        if (ml.get_key("lowbitflash.rot.version", lbf_version, false)) {
+            if (lbf_version != 1) {
+                throw std::runtime_error(format("unsupported lowbitflash.rot.version: %u", lbf_version));
+            }
+            // only architectures verified to route every rotated matmul through
+            // build_lora_mm / build_lora_mm_id may load folded weights
+            switch (arch) {
+                case LLM_ARCH_QWEN4EXP:
+                    break;
+                default:
+                    throw std::runtime_error(format(
+                        "lowbitflash.rot: arch '%s' is not verified to apply the activation transform to all folded weights",
+                        llm_arch_name(arch)));
+            }
+
+            const auto is_rotatable_weight = [](const std::string & name) {
+                // every matmul weight qwen4exp routes through build_lora_mm or
+                // build_lora_mm_id (src/models/qwen4exp.cpp); routers, norms,
+                // indexer, PLE and hc_* tensors never carry a rotation
+                static const char * kinds[] = {
+                    "attn_q", "attn_k", "attn_v", "attn_qkv", "attn_gate", "attn_output",
+                    "ffn_gate", "ffn_up", "ffn_down",
+                    "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps", "ffn_gate_up_exps",
+                    "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
+                    "ssm_out", "ssm_beta", "ssm_alpha",
+                };
+                if (name == "output.weight") {
+                    return true;
+                }
+                if (name.compare(0, 4, "blk.") != 0) {
+                    return false;
+                }
+                size_t pos = 4;
+                while (pos < name.size() && isdigit((unsigned char) name[pos])) {
+                    pos++;
+                }
+                if (pos == 4 || pos >= name.size() || name[pos] != '.') {
+                    return false;
+                }
+                pos++;
+                for (const char * kind : kinds) {
+                    const std::string suffix = std::string(kind) + ".weight";
+                    if (name.compare(pos, std::string::npos, suffix) == 0) {
+                        return true;
+                    }
+                }
+                return false;
+            };
+
+            const auto load_specs = [&](const char * list_key,
+                    std::unordered_map<std::string, llama_lbf_rot_spec> & out, bool inverse) {
+                std::vector<std::string> names;
+                ml.get_arr(list_key, names, inverse ? false : true);
+                for (const auto & wname : names) {
+                    if (inverse) {
+                        if (wname != "token_embd.weight") {
+                            throw std::runtime_error(format(
+                                "lowbitflash.rot: '%s' is not a verified inverse-after-lookup table", wname.c_str()));
+                        }
+                    } else if (!is_rotatable_weight(wname)) {
+                        throw std::runtime_error(format(
+                            "lowbitflash.rot: weight '%s' is not on a verified rotated matmul path", wname.c_str()));
+                    }
+                    if (hadamard_weight_blocks.count(wname) || hadamard_inverse_blocks.count(wname)) {
+                        throw std::runtime_error(format(
+                            "lowbitflash.rot: weight '%s' is also listed in prism.hadamard", wname.c_str()));
+                    }
+                    llama_lbf_rot_spec spec;
+                    const std::string bkey = "lowbitflash.rot.blocks." + wname;
+                    const std::string skey = "lowbitflash.rot.signs."  + wname;
+                    ml.get_arr(bkey, spec.blocks);
+                    std::vector<int32_t> sign_vals;
+                    ml.get_arr(skey, sign_vals);
+                    int64_t sum = 0;
+                    for (const int32_t bs : spec.blocks) {
+                        if (bs < 64 || bs > 8192 || (bs & (bs - 1)) != 0 || bs % 128 != 0) {
+                            throw std::runtime_error(format(
+                                "lowbitflash.rot: block size %d for '%s' is not a supported pow2 multiple of 128",
+                                bs, wname.c_str()));
+                        }
+                        sum += bs;
+                    }
+                    if (sum <= 0 || (int64_t) sign_vals.size() != sum) {
+                        throw std::runtime_error(format(
+                            "lowbitflash.rot: signs length %zu does not match block sum %lld for '%s'",
+                            sign_vals.size(), (long long) sum, wname.c_str()));
+                    }
+                    spec.signs.resize(sign_vals.size());
+                    for (size_t i = 0; i < sign_vals.size(); ++i) {
+                        if (sign_vals[i] != 1 && sign_vals[i] != -1) {
+                            throw std::runtime_error(format(
+                                "lowbitflash.rot: sign value %d for '%s' is not +/-1",
+                                sign_vals[i], wname.c_str()));
+                        }
+                        spec.signs[i] = (int8_t) sign_vals[i];
+                    }
+                    if (!out.emplace(wname, std::move(spec)).second) {
+                        throw std::runtime_error(format("duplicate lowbitflash.rot weight: %s", wname.c_str()));
+                    }
+                }
+            };
+
+            load_specs("lowbitflash.rot.weight_names",   lowbit_rot_specs, false);
+            load_specs("lowbitflash.rot.inverse_names",  lowbit_inv_specs, true);
+        }
+    }
+
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
 
@@ -2155,6 +2271,125 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 __func__, hadamard_rotations.size() + hadamard_inverses.size(), hadamard_inverses.size(),
                 rotations.size(), sign_tensors.size());
     }
+    if (!lowbit_rot_specs.empty() || !lowbit_inv_specs.empty()) {
+        // allocate one F32 tensor per unique (name) rotation block / sign vector
+        // on the same buffer type as the weight it transforms
+        const auto make_f32_tensor = [&](const char * tag, int64_t d0, int64_t d1,
+                const std::vector<float> & data, ggml_backend_buffer_type_t buft) -> ggml_tensor * {
+            ggml_init_params params = {
+                /*.mem_size   =*/ ggml_tensor_overhead(),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            ggml_context_ptr ctx { ggml_init(params) };
+            if (!ctx) {
+                throw std::runtime_error("failed to create lowbitflash.rot tensor context");
+            }
+
+            ggml_tensor * t = d1 > 0
+                ? ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, d0, d1)
+                : ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, d0);
+            ggml_set_name(t, tag);
+
+            ggml_backend_buffer_ptr buffer { ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft) };
+            if (!buffer) {
+                throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
+            }
+            ggml_backend_buffer_set_usage(buffer.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+            GGML_ASSERT(data.size() == (size_t) ggml_nelements(t));
+            ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(float));
+
+            std::vector<ggml_backend_buffer_ptr> buffers;
+            buffers.emplace_back(std::move(buffer));
+            pimpl->ctxs_bufs.emplace_back(std::move(ctx), std::move(buffers));
+            return t;
+        };
+
+        const auto sylvester = [](int64_t bs) {
+            std::vector<float> data((size_t) bs * bs);
+            const float scale = 1.0f / sqrtf((float) bs);
+            for (int64_t row = 0; row < bs; ++row) {
+                for (int64_t col = 0; col < bs; ++col) {
+                    uint32_t parity = (uint32_t) (row & col);
+                    parity ^= parity >> 16;
+                    parity ^= parity >> 8;
+                    parity ^= parity >> 4;
+                    parity ^= parity >> 2;
+                    parity ^= parity >> 1;
+                    data[(size_t) row * bs + col] = (parity & 1) ? -scale : scale;
+                }
+            }
+            return data;
+        };
+
+        size_t lbf_n_rot = 0;
+        size_t lbf_n_sign = 0;
+        const std::pair<const std::unordered_map<std::string, llama_lbf_rot_spec> *, llama_lbf_rotations *> lbf_groups[] = {
+            { &lowbit_rot_specs, &lbf_rotations },
+            { &lowbit_inv_specs, &lbf_inverses },
+        };
+        for (const auto & [specs, target] : lbf_groups)
+        for (const auto & entry : *specs) {
+            const std::string & weight_name = entry.first;
+            const llama_lbf_rot_spec & spec = entry.second;
+            const ggml_tensor * weight = get_tensor(weight_name.c_str());
+            if (weight == nullptr) {
+                throw std::runtime_error(format("lowbitflash.rot weight not found: %s", weight_name.c_str()));
+            }
+            int64_t sum = 0;
+            for (const int32_t bs : spec.blocks) {
+                sum += bs;
+            }
+            if (sum != weight->ne[0]) {
+                throw std::runtime_error(format(
+                    "lowbitflash.rot blocks for %s sum to %lld, input dim is %lld",
+                    weight_name.c_str(), (long long) sum, (long long) weight->ne[0]));
+            }
+            if ((int64_t) spec.signs.size() != weight->ne[0]) {
+                throw std::runtime_error(format("lowbitflash.rot sign length mismatch for %s", weight_name.c_str()));
+            }
+            if (weight->buffer == nullptr) {
+                throw std::runtime_error(format("lowbitflash.rot weight has no buffer: %s", weight_name.c_str()));
+            }
+
+            ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(weight->buffer);
+            if (ggml_backend_dev_t dev = ggml_backend_buft_get_device(buft)) {
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    buft = ggml_backend_dev_buffer_type(dev);
+                }
+            }
+
+            llama_lbf_rotation rot;
+            rot.segs.reserve(spec.blocks.size());
+            int64_t off = 0;
+            for (size_t bi = 0; bi < spec.blocks.size(); ++bi) {
+                const int64_t bs = spec.blocks[bi];
+
+                char rot_name[GGML_MAX_NAME];
+                snprintf(rot_name, sizeof(rot_name), "lowbitflash.rot.H.%s.%lld", weight_name.c_str(), (long long) bi);
+                ggml_tensor * rot_t = make_f32_tensor(rot_name, bs, bs, sylvester(bs), buft);
+                lbf_n_rot++;
+
+                char sign_name[GGML_MAX_NAME];
+                snprintf(sign_name, sizeof(sign_name), "lowbitflash.rot.S.%s.%lld", weight_name.c_str(), (long long) bi);
+                std::vector<float> sdata(bs);
+                for (int64_t i = 0; i < bs; ++i) {
+                    sdata[i] = (float) spec.signs[off + i];
+                }
+                ggml_tensor * sign_t = make_f32_tensor(sign_name, bs, 0, sdata, buft);
+                lbf_n_sign++;
+
+                rot.segs.push_back({ rot_t, sign_t, off, bs });
+                off += bs;
+            }
+            target->emplace(weight, std::move(rot));
+        }
+
+        LLAMA_LOG_INFO("%s: loaded %zu lowbitflash.rot weight(s) (%zu inverse-lookup) using %zu rotation block(s) and %zu sign segment(s)\n",
+                __func__, lbf_rotations.size() + lbf_inverses.size(), lbf_inverses.size(),
+                lbf_n_rot, lbf_n_sign);
+    }
+
 
     return true;
 }

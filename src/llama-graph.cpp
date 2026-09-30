@@ -1521,6 +1521,8 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     dspark_ctx_width(params.dspark_ctx_width),
     hadamard_rotations(params.hadamard_rotations),
     hadamard_inverses(params.hadamard_inverses),
+    lbf_rotations(params.lbf_rotations),
+    lbf_inverses(params.lbf_inverses),
     samplers(params.samplers),
     cb_func(params.cb),
     res(params.res),
@@ -1548,6 +1550,20 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
     ggml_tensor * cur_mm = cur;
+    if (lbf_rotations) {
+        const auto it = lbf_rotations->find(w);
+        if (it != lbf_rotations->end()) {
+            // key on the weight: unlike prism.hadamard, sign diagonals differ per tensor
+            const auto memo_key = std::make_pair((const ggml_tensor *) cur, (const ggml_tensor *) w);
+            const auto memo_it  = lbf_memo.find(memo_key);
+            if (memo_it != lbf_memo.end()) {
+                cur_mm = memo_it->second;
+            } else {
+                cur_mm = llama_lbf_rot_apply(ctx0, cur_mm, it->second, /*inverse=*/false);
+                lbf_memo[memo_key] = cur_mm;
+            }
+        }
+    }
     if (hadamard_rotations) {
         const auto it = hadamard_rotations->find(w);
         if (it != hadamard_rotations->end()) {
@@ -1608,6 +1624,23 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
     ggml_tensor * cur_mm = cur;
+    if (lbf_rotations) {
+        const auto it = lbf_rotations->find(w);
+        if (it != lbf_rotations->end()) {
+            // fused expert weights (ffn_*_exps) share one rotation across experts:
+            // rotating the gathered activation rows before mul_mat_id applies the
+            // same R to every expert's input, which is exactly what the fold
+            // (one sign set per fused tensor) requires
+            const auto memo_key = std::make_pair((const ggml_tensor *) cur, (const ggml_tensor *) w);
+            const auto memo_it  = lbf_memo.find(memo_key);
+            if (memo_it != lbf_memo.end()) {
+                cur_mm = memo_it->second;
+            } else {
+                cur_mm = llama_lbf_rot_apply(ctx0, cur_mm, it->second, /*inverse=*/false);
+                lbf_memo[memo_key] = cur_mm;
+            }
+        }
+    }
     if (hadamard_rotations) {
         const auto it = hadamard_rotations->find(w);
         if (it != hadamard_rotations->end()) {
@@ -2407,6 +2440,15 @@ ggml_tensor * llm_graph_context::build_embd_rows(ggml_tensor * tok_embd, ggml_te
             if (it->second.signs) {
                 cur = ggml_mul(ctx0, cur, it->second.signs);
             }
+        }
+    }
+
+    // lowbitflash.rot latent table: rows are stored in the rotated basis, so
+    // apply the per-segment inverse D_b (H_b z_b) right after the lookup
+    if (lbf_inverses) {
+        const auto it = lbf_inverses->find(tok_embd);
+        if (it != lbf_inverses->end()) {
+            cur = llama_lbf_rot_apply(ctx0, cur, it->second, /*inverse=*/true);
         }
     }
 

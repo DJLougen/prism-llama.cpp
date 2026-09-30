@@ -400,8 +400,16 @@ private:
     llama_hadamard_rotations hadamard_rotations;
     llama_hadamard_rotations hadamard_inverses;
 
+    // lowbitflash.rot.* per-weight segmented rotations (and inverses for
+    // latent embedding lookups), keyed by weight tensor pointer
+    llama_lbf_rotations lbf_rotations;
+    llama_lbf_rotations lbf_inverses;
+
     // one-time Hadamard transform-coverage check on the first built graph
     bool hadamard_verified = false;
+
+    // one-time coverage check for lowbitflash.rot folds on the first built graph
+    bool lbf_verified = false;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;

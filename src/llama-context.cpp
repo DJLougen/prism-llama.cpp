@@ -21,6 +21,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <functional>
 #include <numeric>
 #include <stdexcept>
 #include <string>
@@ -100,6 +101,93 @@ static void llama_verify_hadamard_graph(
             }
             throw std::runtime_error(format(
                 "Hadamard-latent table '%s' is read without the inverse transform",
+                node->src[0]->name));
+        }
+    }
+}
+
+// Same coverage check for lowbitflash.rot segmented folds: every rotated weight
+// consumed by the graph must be fed by a hinted Hadamard mul_mat chain ending
+// in (for multi-segment rotations) a concat of per-block hinted mul_mats.
+static void llama_verify_lbf_graph(
+        ggml_cgraph * gf,
+        const llama_lbf_rotations & rotations,
+        const llama_lbf_rotations & inverses) {
+    auto unwrap = [](const ggml_tensor * t) {
+        while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW || t->op == GGML_OP_CONT)) {
+            t = t->src[0];
+        }
+        return t;
+    };
+
+    auto is_hinted_mm = [](const ggml_tensor * t) {
+        return t && t->op == GGML_OP_MUL_MAT &&
+            ((const int32_t *) t->op_params)[1] == GGML_HINT_SRC0_IS_HADAMARD;
+    };
+
+    // src1 of the weight matmul is the rotated activation: a hinted mm
+    // (single segment, possibly wrapped by a sign mul) or a — possibly nested —
+    // concat tree of hinted mms built by llama_lbf_rot_apply
+    const std::function<bool(const ggml_tensor *)> rotated = [&](const ggml_tensor * t) -> bool {
+        t = unwrap(t);
+        if (!t) { return false; }
+        if (is_hinted_mm(t)) { return true; }
+        if (t->op == GGML_OP_MUL && (is_hinted_mm(unwrap(t->src[0])) || is_hinted_mm(unwrap(t->src[1])))) {
+            return true;
+        }
+        if (t->op == GGML_OP_CONCAT) {
+            for (int s = 0; s < GGML_MAX_SRC && t->src[s]; ++s) {
+                if (!rotated(t->src[s])) { return false; }
+            }
+            return true;
+        }
+        return false;
+    };
+
+    std::map<const ggml_tensor *, bool> lookups; // get_rows of latent tables
+
+    for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+        const ggml_tensor * node = ggml_graph_node(gf, i);
+
+        if (node->op == GGML_OP_GET_ROWS && inverses.count(node->src[0])) {
+            lookups.emplace(node, false);
+            continue;
+        }
+
+        if (is_hinted_mm(node)) {
+            const auto lk = lookups.find(unwrap(node->src[1]));
+            if (lk != lookups.end()) {
+                lk->second = true; // first hinted stage of the inverse
+            }
+            continue;
+        }
+
+        if (node->op != GGML_OP_MUL_MAT && node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+
+        const auto it = rotations.find(node->src[0]);
+        if (it == rotations.end()) {
+            if (inverses.count(node->src[0])) {
+                throw std::runtime_error(format(
+                    "lowbitflash.rot latent table '%s' is used as a head without a forward transform",
+                    node->src[0]->name));
+            }
+            continue;
+        }
+
+        if (!rotated(node->src[1])) {
+            throw std::runtime_error(format(
+                "lowbitflash.rot weight '%s' is consumed without its activation transform; "
+                "this graph's matmul path does not support segmented rotations",
+                node->src[0]->name));
+        }
+    }
+
+    for (const auto & [node, ok] : lookups) {
+        if (!ok) {
+            throw std::runtime_error(format(
+                "lowbitflash.rot latent table '%s' is read without the inverse transform",
                 node->src[0]->name));
         }
     }
@@ -243,11 +331,15 @@ llama_context::llama_context(
 
     hadamard_rotations = model.hadamard_rotations;
     hadamard_inverses  = model.hadamard_inverses;
+    lbf_rotations      = model.lbf_rotations;
+    lbf_inverses       = model.lbf_inverses;
     if (cparams.ctx_other) {
         // Transform entries are keyed by tensor pointer, so borrowed target tensors remain distinct.
         const auto & other = cparams.ctx_other->model;
         hadamard_rotations.insert(other.hadamard_rotations.begin(), other.hadamard_rotations.end());
         hadamard_inverses .insert(other.hadamard_inverses .begin(), other.hadamard_inverses .end());
+        lbf_rotations     .insert(other.lbf_rotations     .begin(), other.lbf_rotations     .end());
+        lbf_inverses      .insert(other.lbf_inverses      .begin(), other.lbf_inverses      .end());
     }
 
     auto rope_scaling_type = params.rope_scaling_type;
@@ -2712,6 +2804,11 @@ ggml_cgraph * llama_context::graph_reserve(
         hadamard_verified = true;
     }
 
+
+    if (!lbf_verified && gf && (!lbf_rotations.empty() || !lbf_inverses.empty())) {
+        llama_verify_lbf_graph(gf, lbf_rotations, lbf_inverses);
+        lbf_verified = true;
+    }
     this->n_outputs = save_n_outputs;
 
     // initialize scheduler with the specified graph
@@ -2753,6 +2850,8 @@ llm_graph_params llama_context::graph_params(
         /*.dspark_ctx_width =*/dspark_ctx.n_embd_cap,
         /*.hadamard_rotations =*/&hadamard_rotations,
         /*.hadamard_inverses  =*/&hadamard_inverses,
+        /*.lbf_rotations      =*/&lbf_rotations,
+        /*.lbf_inverses       =*/&lbf_inverses,
         /*.samplers    =*/sampling.samplers,
         /*.n_outputs   =*/n_outputs,
         /*.cb          =*/graph_get_cb(),

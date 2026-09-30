@@ -740,6 +740,20 @@ struct llama_model {
     llama_hadamard_rotations hadamard_rotations;
     llama_hadamard_rotations hadamard_inverses;
 
+    // lowbitflash.rot.*: per-weight segmented block rotations. lowbit_rot_specs
+    // holds the parsed GGUF metadata (block partition + signs per weight name);
+    // lbf_rotations/lbf_inverses hold the materialized tensors, keyed by the
+    // weight tensor pointer. Weight names ending in ".weight" under
+    // lowbitflash.rot.inverse_names are latent lookup tables (token_embd).
+    struct llama_lbf_rot_spec {
+        std::vector<int32_t> blocks; // pow2 block sizes summing to ne[0]
+        std::vector<int8_t>  signs;  // +/-1, length = ne[0]
+    };
+    std::unordered_map<std::string, llama_lbf_rot_spec> lowbit_rot_specs;
+    std::unordered_map<std::string, llama_lbf_rot_spec> lowbit_inv_specs;
+    llama_lbf_rotations lbf_rotations;
+    llama_lbf_rotations lbf_inverses;
+
     // list of devices used in this model
     std::vector<llama_device> devices;
 

@@ -32,6 +32,86 @@ struct llama_hadamard_transform {
 };
 using llama_hadamard_rotations = std::unordered_map<const ggml_tensor *, llama_hadamard_transform>;
 
+// lowbitFlash per-weight rotation (GGUF keys under lowbitflash.rot.*):
+// a rotated weight W_r = W * Rbar is deployed where Rbar = block-diag(D_b H_b),
+// and y = W x is computed as (s*q) * (R x) with R = block-diag(H_b D_b).
+// Unlike prism.hadamard (one uniform block size + one sign vector per width),
+// each weight here carries its own list of power-of-two block sizes that
+// partition the input dim (e.g. 2560 -> [1024,1024,512], 640 -> [512,128])
+// and its own sha256-derived +/-1 signs (one sign set per fused tensor, shared
+// across all experts of a ffn_*_exps weight).
+struct llama_lbf_rot_segment {
+    ggml_tensor * rot;     // [bs, bs] normalized Sylvester Hadamard, F32
+    ggml_tensor * signs;   // [bs] F32 +/-1 for the forward order x -> H_b (D_b x_b)
+    int64_t       off;     // start column along the input (last) dim
+    int64_t       bs;      // block size, power of two, multiple of 128
+};
+struct llama_lbf_rotation {
+    // forward (y = W_r (R x)): per segment x_b -> D_b x_b -> H_b. Sum of bs
+    // over segments equals the weight input dim.
+    std::vector<llama_lbf_rot_segment> segs;
+};
+using llama_lbf_rotations = std::unordered_map<const ggml_tensor *, llama_lbf_rotation>;
+
+// Applies the lowbitFlash segmented block rotation to an activation tensor.
+//   forward (before the matmul):   x -> concat_b( H_b (D_b x_b) )
+//   inverse (after a row lookup):  z -> concat_b( D_b (H_b z_b) )
+// Each segment is a MUL by the sign diagonal followed by a hinted MUL_MAT whose
+// src0 is the normalized Sylvester Hadamard, so the pair still fuses to the
+// fwht kernel on backends that implement GGML_HINT_SRC0_IS_HADAMARD.
+// Defined inline here (needs the segment type); only calls ggml builders.
+static inline ggml_tensor * llama_lbf_rot_apply(
+        ggml_context * ctx,
+        ggml_tensor * cur,
+        const llama_lbf_rotation & r,
+        bool inverse = false) {
+    GGML_ASSERT(!r.segs.empty());
+
+    const int64_t C    = r.segs.back().off + r.segs.back().bs;
+    const int64_t rest = ggml_nelements(cur) / C;
+
+    ggml_tensor * flat = ggml_is_contiguous(cur)
+        ? ggml_reshape_2d(ctx, cur, C, rest)
+        : ggml_cont_2d     (ctx, cur, C, rest);
+
+    std::vector<ggml_tensor *> parts;
+    parts.reserve(r.segs.size());
+
+    for (const auto & s : r.segs) {
+        GGML_ASSERT(s.rot->ne[0] == s.bs && s.rot->ne[1] == s.bs);
+        GGML_ASSERT(s.signs == nullptr || s.signs->ne[0] == s.bs);
+
+        ggml_tensor * xb = ggml_view_2d(ctx, flat, s.bs, rest, flat->nb[1], s.off * flat->nb[0]);
+        if (!inverse && s.signs) {
+            xb = ggml_mul(ctx, xb, s.signs);            // D_b x_b
+        }
+
+        ggml_tensor * xb2 = ggml_is_contiguous(xb)
+            ? ggml_reshape_2d(ctx, xb, s.bs, ggml_nelements(xb) / s.bs)
+            : ggml_cont_2d     (ctx, xb, s.bs, ggml_nelements(xb) / s.bs);
+
+        ggml_tensor * yb = ggml_mul_mat(ctx, s.rot, xb2);  // H_b (D_b x_b)
+        ggml_mul_mat_set_hint(yb, GGML_HINT_SRC0_IS_HADAMARD);
+
+        if (inverse && s.signs) {
+            yb = ggml_mul(ctx, yb, s.signs);            // D_b (H_b z_b)
+        }
+        parts.push_back(yb);
+    }
+
+    ggml_tensor * res = parts.size() == 1
+        ? parts[0]
+        : ggml_concat(ctx, parts[0], parts[1], 0); // chained below for >2 segs
+
+    for (size_t i = 2; i < parts.size(); ++i) {
+        res = ggml_concat(ctx, res, parts[i], 0);
+    }
+    res = ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+
+    return res;
+}
+
+
 struct llama_cparams;
 struct llama_layer;
 
@@ -863,6 +943,8 @@ struct llm_graph_params {
     int64_t                          dspark_ctx_width;
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
+    const llama_lbf_rotations      * lbf_rotations;
+    const llama_lbf_rotations      * lbf_inverses;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
@@ -1127,10 +1209,16 @@ struct llm_graph_context {
     int64_t                          dspark_ctx_width;
     const llama_hadamard_rotations * hadamard_rotations;
     const llama_hadamard_rotations * hadamard_inverses;
+    const llama_lbf_rotations      * lbf_rotations;
+    const llama_lbf_rotations      * lbf_inverses;
 
     // Transforms shared by folded weights on the same activation. Key is (input, rotation);
     // both must match. Valid for one graph build only.
     mutable std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> hadamard_memo;
+
+    // Per-weight segmented rotations (lowbitflash.rot.*). Key is (input, weight)
+    // because sign values differ per tensor. Valid for one graph build only.
+    mutable std::map<std::pair<const ggml_tensor *, const ggml_tensor *>, ggml_tensor *> lbf_memo;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
