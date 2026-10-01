@@ -1,4 +1,16 @@
-# llama.cpp
+# llama.cpp (Mooney branch — lbf/flashnext-ternary)
+
+> **This branch runs [Qwen3.8-Flash-Next-Mooney](https://huggingface.co/DJLougen/Qwen3.8-Flash-Next-Mooney)** —
+> the 180B-parameter MoE compressed to 92 GB for one DGX Spark. It adds the
+> `PQ2_0` ternary expert format + `lowbitflash.rot.*` rotation metadata the
+> Mooney GGUF needs, plus lazy-SSD loading for the 54.4 GB PLE table.
+> **See [MOONEY.md](MOONEY.md)** or use
+> [mooney-spark](https://github.com/DJLougen/mooney-spark) for one-command
+> setup; a faster cuda.fast-based runtime lives at
+> [cudafast-qwen38-125b-a6b-engine](https://github.com/DJLougen/cudafast-qwen38-125b-a6b-engine).
+>
+> *The PrismML fork README follows.*
+
 
 > [!IMPORTANT]
 > **This is the PrismML fork of llama.cpp**, the main line behind the [Bonsai](https://huggingface.co/collections/prism-ml/bonsai) models (branch `prism`, developed as `prism-v7`). It tracks current mainline llama.cpp and adds the fork's low-bit formats and runtime features on top.
