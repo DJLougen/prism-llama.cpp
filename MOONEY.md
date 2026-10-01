@@ -44,8 +44,8 @@ Run (the exact argv behind the model card's measured numbers):
 
 ```bash
 llama-server \
-  -m Qwen3.8-Flash-Next-Mooney-00001-of-00004.gguf \
-  --mmproj mmproj-Qwen3.8-Flash-Next-Mooney-BF16.gguf \
+  -m Qwen3.8-Flash-Next-Mooney-PQ2_0-00001-of-00004.gguf \
+  --mmproj mmproj-Qwen3.8-Flash-Next-Mooney.gguf \
   --load-mode mmap --tensor-read-lazy on \
   -ot per_layer_token_embd=CPU \
   -ngl all -fa on -np 1 \
